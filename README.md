@@ -32,7 +32,7 @@
 ## 安装
 
 ```bash
-git clone https://github.com/AsakiRain/wexin-cc-connection.git
+git clone https://github.com/ohmyskyhigh/wexin-cc-connection.git
 cd wexin-cc-connection
 npm install
 ```
