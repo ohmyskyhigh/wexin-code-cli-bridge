@@ -7,10 +7,17 @@ export interface BackendResponse {
   costUsd: number;
 }
 
+export interface FileAttachment {
+  path: string;
+  mimeType: string;
+  originalName?: string;
+}
+
 export interface BackendRunOpts {
   timeoutMs?: number;
   model?: string;
   autoApprove?: boolean;
+  files?: FileAttachment[];
 }
 
 export interface BackendRunner {

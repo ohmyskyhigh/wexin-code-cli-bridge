@@ -1,7 +1,29 @@
+import fs from "node:fs";
 import { execFileAsync } from "./exec.js";
 import { logger } from "../logger.js";
 import { loadUserSession, saveUserSession, clearUserSession, loadUserAddDirs } from "../state.js";
 import type { BackendRunner, BackendResponse, BackendRunOpts } from "./types.js";
+
+/** Prepend text file contents to the message for backends without --files support. */
+function prependFileContents(message: string, opts?: BackendRunOpts): string {
+  if (!opts?.files?.length) return message;
+  const parts: string[] = [];
+  for (const file of opts.files) {
+    if (file.mimeType.startsWith("image/")) {
+      parts.push(`[Attached image: ${file.originalName ?? file.path} — image processing not supported by this backend]`);
+      continue;
+    }
+    try {
+      const content = fs.readFileSync(file.path, "utf-8");
+      const name = file.originalName ?? file.path.split("/").pop() ?? "file";
+      parts.push(`File: ${name}\n\`\`\`\n${content}\n\`\`\``);
+    } catch {
+      parts.push(`[Attached file: ${file.originalName ?? file.path} — could not read]`);
+    }
+  }
+  if (!parts.length) return message;
+  return parts.join("\n\n") + "\n\n" + message;
+}
 
 export function buildGeminiArgs(
   message: string,
@@ -9,7 +31,8 @@ export function buildGeminiArgs(
   sessionId?: string,
   addDirs?: string[],
 ): string[] {
-  const args = ["-p", message, "--output-format", "json"];
+  const finalMessage = prependFileContents(message, opts);
+  const args = ["-p", finalMessage, "--output-format", "json"];
 
   if (opts?.autoApprove) {
     args.push("--yolo");

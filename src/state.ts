@@ -138,6 +138,8 @@ type UserSessionData = {
   sessionId?: string;
   sessions?: Record<string, string>;
   addDirs?: string[];
+  contextToken?: string;
+  originalUserId?: string;
   updatedAt?: string;
 };
 
@@ -152,7 +154,7 @@ function loadSessionData(userId: string): UserSessionData {
 
 function saveSessionData(userId: string, data: UserSessionData): void {
   ensureDir(sessionsDir());
-  fs.writeFileSync(sessionPath(userId), JSON.stringify({ ...data, updatedAt: new Date().toISOString() }), "utf-8");
+  fs.writeFileSync(sessionPath(userId), JSON.stringify({ ...data, originalUserId: userId, updatedAt: new Date().toISOString() }), "utf-8");
 }
 
 export function loadUserSession(userId: string, backend?: string): string | undefined {
@@ -213,6 +215,35 @@ export function removeUserDir(userId: string, dir: string): string[] {
 export function clearUserDirs(userId: string): void {
   const data = loadSessionData(userId);
   saveSessionData(userId, { ...data, addDirs: [] });
+}
+
+export function saveContextToken(userId: string, contextToken: string): void {
+  const data = loadSessionData(userId);
+  saveSessionData(userId, { ...data, contextToken });
+}
+
+export function loadContextToken(userId: string): string | undefined {
+  return loadSessionData(userId).contextToken;
+}
+
+/** List all user IDs that have session data. */
+export function listUserIds(): string[] {
+  const dir = sessionsDir();
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir)
+    .filter((f) => f.endsWith(".json"))
+    .map((f) => {
+      try {
+        const raw = fs.readFileSync(path.join(dir, f), "utf-8");
+        const data = JSON.parse(raw) as UserSessionData;
+        if (!data.contextToken) return null;
+        // Prefer the original (unsanitized) user ID stored in data
+        return data.originalUserId ?? f.replace(".json", "");
+      } catch {
+        return null;
+      }
+    })
+    .filter((id): id is string => id !== null);
 }
 
 export function clearAllSessions(): void {
