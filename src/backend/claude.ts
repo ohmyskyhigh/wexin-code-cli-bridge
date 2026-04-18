@@ -25,6 +25,11 @@ export function buildClaudeArgs(
       args.push("--add-dir", dir);
     }
   }
+  if (opts?.files) {
+    for (const file of opts.files) {
+      args.push("--files", file.path);
+    }
+  }
 
   return args;
 }

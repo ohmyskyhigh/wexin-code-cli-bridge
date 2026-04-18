@@ -1,9 +1,15 @@
+import fs from "node:fs";
+import path from "node:path";
 import { getUpdates, sendTyping, getConfig } from "./ilink/api.js";
-import { sendMessageWeixin, markdownToPlainText } from "./ilink/send.js";
-import { MessageItemType, TypingStatus } from "./ilink/types.js";
-import type { WeixinMessage, MessageItem } from "./ilink/types.js";
+import { sendMessageWeixin, markdownToPlainText, sendImageWeixin, sendFileWeixin } from "./ilink/send.js";
+import { downloadAndDecrypt, uploadToWeixin } from "./ilink/media.js";
+import type { UploadedFileInfo } from "./ilink/media.js";
+import { MessageItemType, TypingStatus, UploadMediaType } from "./ilink/types.js";
+import type { WeixinMessage, MessageItem, CDNMedia } from "./ilink/types.js";
 import type { BackendRunner } from "./backend/index.js";
-import { loadSyncCursor, saveSyncCursor, addUserDir, removeUserDir, loadUserAddDirs, clearUserDirs } from "./state.js";
+import type { FileAttachment } from "./backend/types.js";
+import { loadSyncCursor, saveSyncCursor, addUserDir, removeUserDir, loadUserAddDirs, clearUserDirs, saveContextToken } from "./state.js";
+import { saveTempFile, cleanupTempFile, cleanupStaleTempFiles, detectExtension, getMimeFromFilename } from "./media/temp.js";
 import { logger } from "./logger.js";
 
 const DEFAULT_LONG_POLL_TIMEOUT_MS = 35_000;
@@ -11,6 +17,8 @@ const MAX_CONSECUTIVE_FAILURES = 3;
 const BACKOFF_DELAY_MS = 30_000;
 const RETRY_DELAY_MS = 2_000;
 const TEXT_CHUNK_LIMIT = 4000;
+const MAX_BACKEND_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
+const CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
 // Session-expired error code from iLink
 const SESSION_EXPIRED_ERRCODE = -14;
@@ -23,11 +31,12 @@ export type BridgeOpts = {
   model?: string;
   autoApprove?: boolean;
   backend: BackendRunner;
+  cdnBaseUrl?: string;
   onSessionExpired?: () => Promise<{ token: string; accountId: string; baseUrl: string } | null>;
 };
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Text extraction (unchanged)
 // ---------------------------------------------------------------------------
 
 function extractText(itemList?: MessageItem[]): string {
@@ -37,7 +46,6 @@ function extractText(itemList?: MessageItem[]): string {
       const text = String(item.text_item.text);
       const ref = item.ref_msg;
       if (!ref) return text;
-      // Include quoted context
       const parts: string[] = [];
       if (ref.title) parts.push(ref.title);
       if (ref.message_item?.type === MessageItemType.TEXT && ref.message_item.text_item?.text) {
@@ -46,7 +54,6 @@ function extractText(itemList?: MessageItem[]): string {
       if (!parts.length) return text;
       return `[引用: ${parts.join(" | ")}]\n${text}`;
     }
-    // Voice-to-text
     if (item.type === MessageItemType.VOICE && item.voice_item?.text) {
       return item.voice_item.text;
     }
@@ -54,7 +61,97 @@ function extractText(itemList?: MessageItem[]): string {
   return "";
 }
 
-/** Split text into chunks of max `limit` chars, breaking at newlines where possible. */
+// ---------------------------------------------------------------------------
+// Media extraction
+// ---------------------------------------------------------------------------
+
+export type MediaAttachment = {
+  type: "image" | "file";
+  media?: CDNMedia;
+  /** Hex-encoded AES key (preferred for images over media.aes_key) */
+  imageAeskey?: string;
+  fileName?: string;
+};
+
+function extractMedia(itemList?: MessageItem[]): MediaAttachment[] {
+  if (!itemList?.length) return [];
+  const result: MediaAttachment[] = [];
+  for (const item of itemList) {
+    if (item.type === MessageItemType.IMAGE && item.image_item?.media) {
+      result.push({
+        type: "image",
+        media: item.image_item.media,
+        imageAeskey: item.image_item.aeskey,
+      });
+    } else if (item.type === MessageItemType.FILE && item.file_item?.media) {
+      result.push({
+        type: "file",
+        media: item.file_item.media,
+        fileName: item.file_item.file_name,
+      });
+    }
+    // Also extract media from quoted messages
+    if (item.ref_msg?.message_item) {
+      const ref = item.ref_msg.message_item;
+      if (ref.type === MessageItemType.IMAGE && ref.image_item?.media) {
+        result.push({
+          type: "image",
+          media: ref.image_item.media,
+          imageAeskey: ref.image_item.aeskey,
+        });
+      } else if (ref.type === MessageItemType.FILE && ref.file_item?.media) {
+        result.push({
+          type: "file",
+          media: ref.file_item.media,
+          fileName: ref.file_item.file_name,
+        });
+      }
+    }
+  }
+  return result;
+}
+
+/**
+ * Build the aesKeyBase64 string for downloadAndDecrypt.
+ * For images: prefer image_item.aeskey (hex) → convert to base64.
+ * Otherwise: use media.aes_key (already base64).
+ */
+function resolveAesKeyBase64(attachment: MediaAttachment): string | undefined {
+  if (attachment.imageAeskey) {
+    return Buffer.from(attachment.imageAeskey, "hex").toString("base64");
+  }
+  return attachment.media?.aes_key;
+}
+
+// ---------------------------------------------------------------------------
+// File reference detection in backend responses
+// ---------------------------------------------------------------------------
+
+function detectFileReferences(text: string): string[] {
+  // Extract candidate paths (absolute paths not in URLs)
+  const pathRegex = /(?<!\w:\/\/)(?:\/[\w./-]+)/g;
+  const candidates = text.match(pathRegex) ?? [];
+  const results: string[] = [];
+  const seen = new Set<string>();
+  for (const candidate of candidates) {
+    if (seen.has(candidate)) continue;
+    seen.add(candidate);
+    try {
+      const stat = fs.statSync(candidate);
+      if (stat.isFile() && stat.size <= 20 * 1024 * 1024) {
+        results.push(candidate);
+      }
+    } catch {
+      // Not a real file
+    }
+  }
+  return results;
+}
+
+// ---------------------------------------------------------------------------
+// Text chunking
+// ---------------------------------------------------------------------------
+
 function chunkText(text: string, limit: number): string[] {
   if (text.length <= limit) return [text];
   const chunks: string[] = [];
@@ -64,7 +161,6 @@ function chunkText(text: string, limit: number): string[] {
       chunks.push(remaining);
       break;
     }
-    // Try to break at a newline within the limit
     let breakAt = remaining.lastIndexOf("\n", limit);
     if (breakAt <= 0) breakAt = limit;
     chunks.push(remaining.slice(0, breakAt));
@@ -73,7 +169,10 @@ function chunkText(text: string, limit: number): string[] {
   return chunks;
 }
 
-// Typing ticket cache per user
+// ---------------------------------------------------------------------------
+// Typing ticket cache
+// ---------------------------------------------------------------------------
+
 const typingTicketCache = new Map<string, string>();
 
 async function fetchTypingTicket(
@@ -96,6 +195,10 @@ async function fetchTypingTicket(
   return undefined;
 }
 
+// ---------------------------------------------------------------------------
+// Process one message (with media support)
+// ---------------------------------------------------------------------------
+
 async function processOneMessage(
   msg: WeixinMessage,
   opts: BridgeOpts,
@@ -103,9 +206,11 @@ async function processOneMessage(
   const fromUser = msg.from_user_id ?? "";
   const contextToken = msg.context_token;
   const text = extractText(msg.item_list);
+  const mediaAttachments = extractMedia(msg.item_list);
 
-  if (!text.trim()) {
-    logger.debug(`Skipping empty/media-only message from ${fromUser}`);
+  // Skip if no text AND no media
+  if (!text.trim() && mediaAttachments.length === 0) {
+    logger.debug(`Skipping empty message from ${fromUser}`);
     return;
   }
 
@@ -114,13 +219,22 @@ async function processOneMessage(
     return;
   }
 
-  logger.info(`Inbound: from=${fromUser} text="${text.slice(0, 60)}${text.length > 60 ? "..." : ""}"`);
+  // Cache context token for use by the `send` CLI command
+  saveContextToken(fromUser, contextToken);
 
-  // Handle slash commands
+  if (mediaAttachments.length > 0) {
+    logger.info(`Inbound: from=${fromUser} text="${text.slice(0, 40)}..." media=${mediaAttachments.length} items`);
+  } else {
+    logger.info(`Inbound: from=${fromUser} text="${text.slice(0, 60)}${text.length > 60 ? "..." : ""}"`);
+  }
+
+  const sendOpts = { baseUrl: opts.baseUrl, token: opts.token, contextToken };
+
+  // Handle slash commands (only for text-only messages)
   const trimmed = text.trim();
-  if (trimmed.startsWith("/")) {
+  if (trimmed.startsWith("/") && mediaAttachments.length === 0) {
     const sendReply = (msg: string) =>
-      sendMessageWeixin({ to: fromUser, text: msg, opts: { baseUrl: opts.baseUrl, token: opts.token, contextToken } });
+      sendMessageWeixin({ to: fromUser, text: msg, opts: sendOpts });
 
     if (trimmed === "/clear") {
       opts.backend.resetSession(fromUser);
@@ -166,6 +280,12 @@ async function processOneMessage(
       return;
     }
 
+    if (trimmed === "/cleanup") {
+      const count = cleanupStaleTempFiles(0);
+      await sendReply(`✅ 已清理 ${count} 个临时文件。`);
+      return;
+    }
+
     if (trimmed === "/help") {
       await sendReply(
         "可用命令:\n" +
@@ -174,7 +294,9 @@ async function processOneMessage(
         "  /rm-dir <路径>  — 移除目录\n" +
         "  /dirs        — 查看当前目录列表\n" +
         "  /clear-dirs  — 清除所有额外目录\n" +
-        "  /help        — 显示本帮助"
+        "  /cleanup     — 清理临时文件\n" +
+        "  /help        — 显示本帮助\n\n" +
+        "支持发送图片和文件进行分析。"
       );
       return;
     }
@@ -190,16 +312,97 @@ async function processOneMessage(
     });
   }
 
+  // Download media attachments to temp files
+  const tempFiles: string[] = [];
+  const fileAttachments: FileAttachment[] = [];
+
+  if (mediaAttachments.length > 0) {
+    for (const attachment of mediaAttachments) {
+      try {
+        const aesKeyBase64 = resolveAesKeyBase64(attachment);
+        if (!aesKeyBase64 && !attachment.media?.full_url) {
+          logger.warn(`Skipping media: no AES key and no full_url`);
+          continue;
+        }
+
+        let buffer: Buffer;
+        if (aesKeyBase64) {
+          buffer = await downloadAndDecrypt({
+            encryptQueryParam: attachment.media?.encrypt_query_param,
+            aesKeyBase64,
+            cdnBaseUrl: opts.cdnBaseUrl,
+            fullUrl: attachment.media?.full_url,
+            label: `inbound-${attachment.type}`,
+          });
+        } else {
+          // No AES key but has full_url — try plain download
+          const res = await fetch(attachment.media!.full_url!);
+          if (!res.ok) throw new Error(`Plain download failed: ${res.status}`);
+          buffer = Buffer.from(await res.arrayBuffer());
+        }
+
+        // File size check
+        if (buffer.length > MAX_BACKEND_FILE_SIZE) {
+          logger.warn(`Skipping ${attachment.type}: ${buffer.length} bytes exceeds ${MAX_BACKEND_FILE_SIZE} limit`);
+          continue;
+        }
+
+        // Determine extension and MIME
+        let ext: string;
+        let mimeType: string;
+        if (attachment.fileName) {
+          ext = path.extname(attachment.fileName) || detectExtension(buffer);
+          mimeType = getMimeFromFilename(attachment.fileName);
+        } else {
+          ext = detectExtension(buffer);
+          mimeType = attachment.type === "image" ? "image/jpeg" : "application/octet-stream";
+          if (ext === ".png") mimeType = "image/png";
+          else if (ext === ".gif") mimeType = "image/gif";
+          else if (ext === ".webp") mimeType = "image/webp";
+          else if (ext === ".pdf") mimeType = "application/pdf";
+        }
+
+        const tempPath = saveTempFile(buffer, ext);
+        tempFiles.push(tempPath);
+        fileAttachments.push({
+          path: tempPath,
+          mimeType,
+          originalName: attachment.fileName,
+        });
+        logger.info(`Media saved: ${attachment.type} ${ext} ${buffer.length} bytes → ${tempPath}`);
+      } catch (err) {
+        logger.error(`Failed to download ${attachment.type} media: ${String(err)}`);
+      }
+    }
+  }
+
+  // Build prompt (default prompt if media but no text)
+  let prompt = text.trim();
+  if (!prompt && fileAttachments.length > 0) {
+    const types = fileAttachments.map((f) => f.mimeType.startsWith("image/") ? "image" : f.originalName ?? "file");
+    prompt = types.some((t) => t === "image")
+      ? "请描述这张图片"
+      : `请分析这个文件: ${types.join(", ")}`;
+  }
+
   // Invoke CLI backend
   let response: string;
   try {
-    const result = await opts.backend.run(text, fromUser, { model: opts.model, autoApprove: opts.autoApprove });
+    const result = await opts.backend.run(prompt, fromUser, {
+      model: opts.model,
+      autoApprove: opts.autoApprove,
+      files: fileAttachments.length > 0 ? fileAttachments : undefined,
+    });
     response = markdownToPlainText(result.result);
     logger.info(`${opts.backend.name} response: ${result.durationMs}ms, cost=$${result.costUsd.toFixed(4)}, len=${response.length}`);
-    logger.info(`${opts.backend.name} reply:\n${response}`);
   } catch (err) {
     logger.error(`${opts.backend.name} invocation failed: ${String(err)}`);
     response = "⚠️ 处理消息时出错，请稍后重试。";
+  } finally {
+    // Always cleanup temp files
+    for (const tempPath of tempFiles) {
+      cleanupTempFile(tempPath);
+    }
   }
 
   // Cancel typing
@@ -211,15 +414,37 @@ async function processOneMessage(
     });
   }
 
-  // Send reply (chunked if needed)
+  // Detect file references in backend response and upload them
+  const fileRefs = detectFileReferences(response);
+  for (const filePath of fileRefs) {
+    try {
+      const mime = getMimeFromFilename(filePath);
+      const isImage = mime.startsWith("image/");
+      const mediaType = isImage ? UploadMediaType.IMAGE : UploadMediaType.FILE;
+      const uploaded = await uploadToWeixin({
+        filePath,
+        toUserId: fromUser,
+        mediaType,
+        opts: { baseUrl: opts.baseUrl, token: opts.token },
+        cdnBaseUrl: opts.cdnBaseUrl,
+        label: `outbound-${isImage ? "image" : "file"}`,
+      });
+      if (isImage) {
+        await sendImageWeixin({ to: fromUser, text: "", uploaded, opts: sendOpts });
+      } else {
+        await sendFileWeixin({ to: fromUser, text: "", fileName: path.basename(filePath), uploaded, opts: sendOpts });
+      }
+      logger.info(`Sent outbound ${isImage ? "image" : "file"}: ${filePath}`);
+    } catch (err) {
+      logger.error(`Failed to upload/send file ${filePath}: ${String(err)}`);
+    }
+  }
+
+  // Send text reply (chunked if needed)
   const chunks = chunkText(response, TEXT_CHUNK_LIMIT);
   for (const chunk of chunks) {
     try {
-      await sendMessageWeixin({
-        to: fromUser,
-        text: chunk,
-        opts: { baseUrl: opts.baseUrl, token: opts.token, contextToken },
-      });
+      await sendMessageWeixin({ to: fromUser, text: chunk, opts: sendOpts });
     } catch (err) {
       logger.error(`Failed to send reply to ${fromUser}: ${String(err)}`);
     }
@@ -246,6 +471,18 @@ export async function startBridge(opts: BridgeOpts): Promise<void> {
 
   logger.info(`Bridge started: baseUrl=${baseUrl} account=${accountId}`);
 
+  // Cleanup stale temp files from previous sessions
+  const cleaned = cleanupStaleTempFiles();
+  if (cleaned > 0) {
+    logger.info(`Cleaned up ${cleaned} stale temp file(s) from previous session`);
+  }
+
+  // Periodic cleanup
+  const cleanupTimer = setInterval(() => {
+    cleanupStaleTempFiles();
+  }, CLEANUP_INTERVAL_MS);
+  abortSignal?.addEventListener("abort", () => clearInterval(cleanupTimer), { once: true });
+
   let cursor = loadSyncCursor(accountId) ?? "";
   if (cursor) {
     logger.info(`Resuming from saved sync cursor (${cursor.length} bytes)`);
@@ -265,12 +502,10 @@ export async function startBridge(opts: BridgeOpts): Promise<void> {
         timeoutMs: nextTimeoutMs,
       });
 
-      // Update server-suggested timeout
       if (resp.longpolling_timeout_ms != null && resp.longpolling_timeout_ms > 0) {
         nextTimeoutMs = resp.longpolling_timeout_ms;
       }
 
-      // Check for API errors
       const isApiError =
         (resp.ret !== undefined && resp.ret !== 0) ||
         (resp.errcode !== undefined && resp.errcode !== 0);
@@ -314,13 +549,11 @@ export async function startBridge(opts: BridgeOpts): Promise<void> {
 
       consecutiveFailures = 0;
 
-      // Save cursor
       if (resp.get_updates_buf != null && resp.get_updates_buf !== "") {
         saveSyncCursor(accountId, resp.get_updates_buf);
         cursor = resp.get_updates_buf;
       }
 
-      // Process messages
       const msgs = resp.msgs ?? [];
       for (const msg of msgs) {
         try {
@@ -332,6 +565,7 @@ export async function startBridge(opts: BridgeOpts): Promise<void> {
     } catch (err) {
       if (abortSignal?.aborted) {
         logger.info("Bridge stopped (aborted)");
+        clearInterval(cleanupTimer);
         return;
       }
       consecutiveFailures++;
@@ -346,5 +580,6 @@ export async function startBridge(opts: BridgeOpts): Promise<void> {
     }
   }
 
+  clearInterval(cleanupTimer);
   logger.info("Bridge ended");
 }

@@ -6,7 +6,7 @@ export function execFileAsync(
   opts?: { timeout?: number },
 ): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    execFile(cmd, args, {
+    const child = execFile(cmd, args, {
       maxBuffer: 10 * 1024 * 1024,
       timeout: opts?.timeout ?? 5 * 60_000,
       env: { ...process.env },
@@ -21,5 +21,7 @@ export function execFileAsync(
         resolve({ stdout: stdout.toString(), stderr: stderr?.toString() ?? "" });
       }
     });
+    // Close stdin so CLI backends don't wait for input
+    child.stdin?.end();
   });
 }

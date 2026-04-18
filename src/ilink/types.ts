@@ -48,6 +48,8 @@ export interface CDNMedia {
   encrypt_query_param?: string;
   aes_key?: string;
   encrypt_type?: number;
+  /** Full download URL (server may provide directly). */
+  full_url?: string;
 }
 
 export interface ImageItem {
@@ -152,4 +154,24 @@ export interface GetConfigResp {
   ret?: number;
   errmsg?: string;
   typing_ticket?: string;
+}
+
+export interface GetUploadUrlReq {
+  filekey?: string;
+  media_type?: number;
+  to_user_id?: string;
+  rawsize?: number;
+  rawfilemd5?: string;
+  filesize?: number;
+  thumb_rawsize?: number;
+  thumb_rawfilemd5?: string;
+  thumb_filesize?: number;
+  no_need_thumb?: boolean;
+  aeskey?: string;
+}
+
+export interface GetUploadUrlResp {
+  upload_param?: string;
+  thumb_upload_param?: string;
+  upload_full_url?: string;
 }

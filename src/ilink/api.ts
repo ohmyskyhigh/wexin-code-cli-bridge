@@ -11,6 +11,8 @@ import type {
   SendMessageReq,
   SendTypingReq,
   GetConfigResp,
+  GetUploadUrlReq,
+  GetUploadUrlResp,
   BaseInfo,
 } from "./types.js";
 
@@ -187,4 +189,33 @@ export async function sendTyping(
     // Typing is best-effort; never let it break the flow
     logger.debug(`sendTyping failed (non-fatal): ${String(err)}`);
   }
+}
+
+/** Get a pre-signed CDN upload URL for a file. */
+export async function getUploadUrl(
+  params: GetUploadUrlReq & WeixinApiOptions,
+): Promise<GetUploadUrlResp> {
+  const rawText = await apiFetch({
+    baseUrl: params.baseUrl,
+    endpoint: "ilink/bot/getuploadurl",
+    body: JSON.stringify({
+      filekey: params.filekey,
+      media_type: params.media_type,
+      to_user_id: params.to_user_id,
+      rawsize: params.rawsize,
+      rawfilemd5: params.rawfilemd5,
+      filesize: params.filesize,
+      thumb_rawsize: params.thumb_rawsize,
+      thumb_rawfilemd5: params.thumb_rawfilemd5,
+      thumb_filesize: params.thumb_filesize,
+      no_need_thumb: params.no_need_thumb,
+      aeskey: params.aeskey,
+      base_info: buildBaseInfo(),
+    }),
+    token: params.token,
+    timeoutMs: params.timeoutMs ?? DEFAULT_API_TIMEOUT_MS,
+    label: "getUploadUrl",
+  });
+  logger.debug(`getUploadUrl response: ${rawText}`);
+  return JSON.parse(rawText) as GetUploadUrlResp;
 }
